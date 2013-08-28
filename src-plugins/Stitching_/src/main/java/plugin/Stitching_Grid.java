@@ -3,19 +3,28 @@ package plugin;
 import static stitching.CommonFunctions.addHyperLinkListener;
 import fiji.util.gui.GenericDialogPlus;
 import ij.IJ;
+import ij.ImageJ;
 import ij.ImagePlus;
 import ij.gui.MultiLineLabel;
+import ij.gui.Roi;
 import ij.plugin.PlugIn;
+import ij.plugin.frame.RoiManager;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import loci.common.services.ServiceFactory;
 import loci.formats.ChannelSeparator;
+import loci.formats.FormatException;
 import loci.formats.IFormatReader;
+import loci.formats.ImageReader;
+import loci.formats.MetadataTools;
 import loci.formats.meta.IMetadata;
 import loci.formats.meta.MetadataRetrieve;
 import loci.formats.services.OMEXMLService;
@@ -60,6 +69,7 @@ public class Stitching_Grid implements PlugIn
 	
 	public static String defaultFileNames = "tile_{ii}.tif";
 	public static String defaultTileConfiguration = "TileConfiguration.txt";
+	public static boolean defaultAddTilesAsRois = false;
 	public static boolean defaultComputeOverlap = true;
 	public static boolean defaultInvertX = false;
 	public static boolean defaultInvertY = false;
@@ -160,7 +170,7 @@ public class Stitching_Grid implements PlugIn
 		// added by John Lapage: creates text box in which the user can set which range to compare within. Would be nicer as an Integer.
 		if (gridType == 7) 
 			gd.addNumericField( "Frame range to compare", defaultSeqRange, 0 );
-		
+		gd.addCheckbox("Add_tiles_as_ROIs", defaultAddTilesAsRois);
 		if ( gridType < 5 )
 			gd.addCheckbox( "Compute_overlap (otherwise use approximate grid coordinates)", defaultComputeOverlap );
 		else if ( gridType == 6 && gridOrder == 0 )
@@ -274,6 +284,8 @@ public class Stitching_Grid implements PlugIn
 		if ( gridType == 7) 
 			params.seqRange = (int)(defaultSeqRange = Math.round( gd.getNextNumber() ) );
 		
+		final boolean addTilesAsRois = params.addTilesAsRois = defaultAddTilesAsRois = gd.getNextBoolean();
+		
 		// Modified by John Lapage (rearranged). Copies the setup for Unknown Positions. User specifies this with all other options.
 		if ( gridType == 5 || gridType == 7)
 			params.computeOverlap = true;
@@ -360,7 +372,7 @@ public class Stitching_Grid implements PlugIn
 		else if ( gridType == 5 || gridType == 7)
 			elements = getAllFilesInDirectory( directory, confirmFiles );
 		else if ( gridType == 6 && gridOrder == 1 )
-			elements = getLayoutFromMultiSeriesFile( seriesFile, increaseOverlap, ignoreCalibration, invertX, invertY, ignoreZStage );
+			elements = getLayoutFromMultiSeriesFile( seriesFile, increaseOverlap, ignoreCalibration, invertX, invertY, ignoreZStage, addTilesAsRois );
 		else if ( gridType == 6 )
 			elements = getLayoutFromFile( directory, outputFile );
 		else
@@ -560,10 +572,14 @@ public class Stitching_Grid implements PlugIn
 			IJ.log( "Finished fusion (" + (System.currentTimeMillis() - time) + " ms)");
 			IJ.log( "Finished ... (" + (System.currentTimeMillis() - startTime) + " ms)");
 			
+			
 			if ( imp != null )
 			{
 				imp.setTitle( "Fused" );
+				
 				imp.show();
+
+				if (addTilesAsRois) generateRois(elements, images, imp);
 			}
 		}
 		
@@ -572,7 +588,107 @@ public class Stitching_Grid implements PlugIn
     		element.close();
 	}
 	
-	protected ArrayList< ImageCollectionElement > getLayoutFromMultiSeriesFile( final String multiSeriesFile, final double increaseOverlap, final boolean ignoreCalibration, final boolean invertX, final boolean invertY, final boolean ignoreZStage )
+	private void generateRois(ArrayList<ImageCollectionElement> elements, ArrayList<ImagePlus> coordinates, ImagePlus fusedImage) {
+		IJ.showStatus("Generating ROIs from image tiles...");
+		
+		RoiManager rm = RoiManager.getInstance();
+		if (rm == null) rm = new RoiManager();
+		int tile = 1;
+		
+		int xOffset = 0;
+		int yOffset = 0;
+		
+		final String fileName = elements.get(0).getFile().getAbsolutePath();
+
+		IJ.log("Initializing Bio-Formats reader to determine file ids...");
+		IFormatReader in = null;
+		try {
+			in = initializeReader(fileName);
+		}
+		catch (FormatException e) {
+			IJ.log("Failed to discover file names. FormatException when parsing: " + fileName );
+		}
+		catch (IOException e) {
+			IJ.log("Failed to discover file names. IOException when parsing: " + fileName );
+		}
+		
+		Map<Integer, List<Roi>> roisBySlice = new HashMap<Integer, List<Roi>>();
+		
+		// first pass to find the global x,y offsets
+		for (int i=0; i<coordinates.size(); i++) {
+			ImageCollectionElement coord = elements.get(i);
+			ImagePlus unfused = coordinates.get(i);
+			int coordXOffset = (int)Math.ceil(coord.getOffset(0)) + xOffset;
+			int coordYOffset = (int)Math.ceil(coord.getOffset(1)) + yOffset;
+			// adjust the global offsets to bring tiles above/to the left to the
+			// image borders
+			if (coordXOffset < 0) xOffset = 0 - coordXOffset;
+			if (coordYOffset < 0) yOffset = 0 - coordYOffset;
+			
+			// adjust the global offsets to bring tiles below/to the right to the
+			// image borders
+			if (unfused.getHeight() + coordYOffset + yOffset > fusedImage.getHeight())
+				yOffset = fusedImage.getHeight() - coordYOffset - unfused.getHeight();
+			if (unfused.getWidth() + coordXOffset + xOffset > fusedImage.getWidth())
+				xOffset = fusedImage.getWidth() - coordXOffset - unfused.getWidth();
+		}
+		
+		// second pass creates the rois
+		for (int i=0; i<coordinates.size(); i++) {
+			ImageCollectionElement coord = elements.get(i);
+			ImagePlus unfused = coordinates.get(i);
+			int slice = 1;
+			int coordXOffset = (int)Math.ceil(coord.getOffset(0)) + xOffset;
+			int coordYOffset = (int)Math.ceil(coord.getOffset(1)) + yOffset;
+			final int numSlices = unfused.getNFrames() * unfused.getNSlices() * unfused.getNChannels();
+
+			for (int t=0; t<unfused.getNFrames(); t++) {
+				for (int z=0; z<unfused.getNSlices(); z++) {
+					for (int c=0; c<unfused.getNChannels(); c++) {
+						Roi roi = new Roi(coordXOffset, coordYOffset, unfused.getWidth(), unfused.getHeight());
+						roi.setPosition(slice);
+						String roiName = "sp=" + slice + "; label=" + tile + "; C=" + c + "; Z=" + z + "; T=" + t;
+						if (in != null) {
+							//TODO fix index
+							int sliceIndex =  ((tile - 1) * numSlices) + in.getIndex(z, c, t);
+							System.out.println(tile + " " + in.getIndex(z, c, t) + " " + sliceIndex);
+							String sourceName = in.getUsedFiles()[sliceIndex];
+							roiName += "; file=" + new File(sourceName).getName();
+						}
+						roi.setName(roiName);
+						roi.setImage(fusedImage);
+
+						if (roisBySlice.get(slice) == null) roisBySlice.put(slice, new ArrayList<Roi>());
+
+						roisBySlice.get(slice).add(roi);
+						slice++;
+					}
+				}
+			}
+			tile++;
+		}
+
+		IJ.log("Adding ROIs...");
+		for (Integer slice : roisBySlice.keySet()) {
+			for (Roi roi : roisBySlice.get(slice)) rm.add(fusedImage, roi, 0);
+		}
+		
+		IJ.log("ROIs generated.");
+		
+		rm.runCommand("Show All");
+	}
+	
+	private IFormatReader initializeReader(final String file)
+			throws FormatException, IOException
+		{
+			final ImageReader in = new ImageReader();
+			final IMetadata omeMeta = MetadataTools.createOMEXMLMetadata();
+			in.setMetadataStore(omeMeta);
+			in.setId(file);
+			return in;
+		}	
+	
+	protected ArrayList< ImageCollectionElement > getLayoutFromMultiSeriesFile( final String multiSeriesFile, final double increaseOverlap, final boolean ignoreCalibration, final boolean invertX, final boolean invertY, final boolean ignoreZStage, final boolean addTilesAsRois )
 	{
 		if ( multiSeriesFile == null || multiSeriesFile.length() == 0 )
 		{
@@ -1425,5 +1541,10 @@ public class Stitching_Grid implements PlugIn
 		
 		return output;
 	}
+	
+  public static void main(String[] args) {
+    new ImageJ().exitWhenQuitting(true);
+     IJ.runPlugIn(Stitching_Grid.class.getName(), "");
+}
 }
  
